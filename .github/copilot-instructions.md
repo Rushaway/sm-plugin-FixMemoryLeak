@@ -14,9 +14,11 @@ This repository contains the **FixMemoryLeak** SourceMod plugin, designed to pre
 - Restart-loop circuit breakers (`sm_restart_min_uptime`, `sm_restart_cooldown`): the plugin can
   never fire two automatic restarts closer together than the cooldown, regardless of what the
   scheduling/persisted state says - this is what guarantees it can't restart on every map change.
-- Staged, spaced-out countdown warnings (`sm_restart_warn_thresholds` / `sm_restart_warn_close`):
-  players get one announcement per threshold far out, and an announcement on every map (throttled
-  by `sm_restart_warn_min_interval`) once the restart is imminent.
+- Live countdown warnings that always show the actual remaining time ("restart in 23 minutes",
+  then 22, 21, ...) instead of snapping to fixed checkpoints. Spacing is just a minimum interval:
+  a long one (`sm_restart_warn_interval`) while far from the restart so it doesn't fire on every
+  map, and a short one (`sm_restart_warn_close_interval`) once inside `sm_restart_warn_close`
+  minutes so it effectively fires on every map.
 - Config file is self-healing: a missing or corrupted `configs/fixmemoryleak.cfg` is backed up
   (`.corrupt-<timestamp>`) and regenerated with safe defaults, and all writes are atomic
   (temp file + re-parse validation + rename) to survive a crash mid-write.

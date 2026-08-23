@@ -34,10 +34,9 @@ ConVar g_cRestartMode, g_cRestartDelay;
 ConVar g_cMaxPlayers, g_cMaxPlayersCountBots;
 ConVar g_cvEarlySvRestart;
 ConVar g_cMinUptime, g_cCooldown;
-ConVar g_cWarnThresholds, g_cWarnClose, g_cWarnMinInterval;
+ConVar g_cWarnClose, g_cWarnInterval, g_cWarnCloseInterval;
 
 ArrayList g_iConfiguredRestarts = null;
-ArrayList g_iWarnThresholds = null;
 
 bool g_bLate = false;
 bool g_bDebug = false;
@@ -54,7 +53,8 @@ int g_iMaxPlayers;
 int g_iMinUptime;
 int g_iCooldown;
 int g_iWarnClose;
-int g_iWarnMinInterval;
+int g_iWarnInterval;
+int g_iWarnCloseInterval;
 
 // Runtime restart state, cached in memory and mirrored to the "info" section of
 // CONFIG_PATH. Reads never hit disk; writes go through WriteRuntimeState() which is
@@ -65,9 +65,8 @@ bool g_bStateRestarted = false;
 bool g_bStateChanged = false;
 int g_iLastRestartTime = 0;
 
-// Staged countdown warning bookkeeping (in-memory only, re-armed whenever the
-// restart target time changes via SetNextRestart()).
-int g_iLastWarnedThreshold = 999999;
+// Countdown warning bookkeeping (in-memory only, reset whenever the restart target
+// time changes via SetNextRestart()).
 float g_flLastWarnTime = 0.0;
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
@@ -89,9 +88,9 @@ public void OnPluginStart()
 	g_cvEarlySvRestart = CreateConVar("sm_fixmemoryleak_early_restart", "1", "Early restart if no players are connected. (sm_restart_delay / 2)", FCVAR_NOTIFY, true, 0.0, true, 1.0);
 	g_cMinUptime = CreateConVar("sm_restart_min_uptime", "10", "Safety floor: an automatic restart may never be scheduled less than this many minutes from now, regardless of mode/schedule.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
 	g_cCooldown = CreateConVar("sm_restart_cooldown", "10", "Safety floor: minimum minutes between two automatic restarts. Guarantees the plugin can never restart on every map in a row, even if the schedule/state is wrong. 0 = disabled.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
-	g_cWarnThresholds = CreateConVar("sm_restart_warn_thresholds", "60,30,15,10,5,2,1", "Comma-separated list of minutes-before-restart at which to announce a one-time countdown warning.", FCVAR_NOTIFY);
-	g_cWarnClose = CreateConVar("sm_restart_warn_close", "15", "Below this many minutes remaining, announce the countdown on every map (throttled by sm_restart_warn_min_interval) instead of once per threshold.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
-	g_cWarnMinInterval = CreateConVar("sm_restart_warn_min_interval", "180", "Minimum seconds between two countdown announcements while inside the sm_restart_warn_close window.", FCVAR_NOTIFY, true, 0.0, true, 3600.0);
+	g_cWarnClose = CreateConVar("sm_restart_warn_close", "15", "Below this many minutes remaining, countdown announcements switch to the (short) sm_restart_warn_close_interval spacing instead of sm_restart_warn_interval, so they show up on effectively every map.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
+	g_cWarnInterval = CreateConVar("sm_restart_warn_interval", "600", "Minimum seconds between two countdown announcements ('restart in N minutes') while more than sm_restart_warn_close minutes remain. Keeps far-out warnings from firing on every single map.", FCVAR_NOTIFY, true, 0.0, true, 21600.0);
+	g_cWarnCloseInterval = CreateConVar("sm_restart_warn_close_interval", "60", "Minimum seconds between two countdown announcements while inside the sm_restart_warn_close window. Kept short so it still fires on effectively every map.", FCVAR_NOTIFY, true, 0.0, true, 3600.0);
 
 	// Hook CVARs
 	HookConVarChange(g_cRestartMode, OnCvarChanged);
@@ -101,9 +100,9 @@ public void OnPluginStart()
 	HookConVarChange(g_cvEarlySvRestart, OnCvarChanged);
 	HookConVarChange(g_cMinUptime, OnCvarChanged);
 	HookConVarChange(g_cCooldown, OnCvarChanged);
-	HookConVarChange(g_cWarnThresholds, OnCvarChanged);
 	HookConVarChange(g_cWarnClose, OnCvarChanged);
-	HookConVarChange(g_cWarnMinInterval, OnCvarChanged);
+	HookConVarChange(g_cWarnInterval, OnCvarChanged);
+	HookConVarChange(g_cWarnCloseInterval, OnCvarChanged);
 
 	// Initialize values
 	g_iMode = g_cRestartMode.IntValue;
@@ -114,8 +113,8 @@ public void OnPluginStart()
 	g_iMinUptime = g_cMinUptime.IntValue;
 	g_iCooldown = g_cCooldown.IntValue;
 	g_iWarnClose = g_cWarnClose.IntValue;
-	g_iWarnMinInterval = g_cWarnMinInterval.IntValue;
-	ParseWarnThresholds();
+	g_iWarnInterval = g_cWarnInterval.IntValue;
+	g_iWarnCloseInterval = g_cWarnCloseInterval.IntValue;
 
 	AutoExecConfig(true);
 
@@ -141,9 +140,6 @@ public void OnPluginEnd()
 
 	if (g_iConfiguredRestarts != null)
 		delete g_iConfiguredRestarts;
-
-	if (g_iWarnThresholds != null)
-		delete g_iWarnThresholds;
 }
 
 public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -164,10 +160,10 @@ public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] new
 		g_iCooldown = g_cCooldown.IntValue;
 	else if (convar == g_cWarnClose)
 		g_iWarnClose = g_cWarnClose.IntValue;
-	else if (convar == g_cWarnMinInterval)
-		g_iWarnMinInterval = g_cWarnMinInterval.IntValue;
-	else if (convar == g_cWarnThresholds)
-		ParseWarnThresholds();
+	else if (convar == g_cWarnInterval)
+		g_iWarnInterval = g_cWarnInterval.IntValue;
+	else if (convar == g_cWarnCloseInterval)
+		g_iWarnCloseInterval = g_cWarnCloseInterval.IntValue;
 }
 
 public void OnMapStart()
@@ -460,26 +456,27 @@ public Action Command_SelfTest(int client, int argc)
 		else { iFail++; ReplyToCommand(client, "[FAIL] GetConfiguredRestartTime lands on the configured day/hour/minute (got day=%d hour=%d min=%d, now=%d, result=%d)", iResultDay, iResultHour, iResultMinute, iNow, iResult); }
 	}
 
-	// PickWarnThreshold selects the largest crossed, not-yet-announced tier.
+	// ShouldAnnounceCountdown uses the long "far" spacing while well ahead of the restart.
 	{
-		ArrayList thresholds = new ArrayList();
-		thresholds.Push(60);
-		thresholds.Push(30);
-		thresholds.Push(15);
+		bool bResult = ShouldAnnounceCountdown(45, 15, 0.0, 500.0, 600, 60);
+		if (!bResult) { iPass++; ReplyToCommand(client, "[PASS] ShouldAnnounceCountdown throttles far-out announcements"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ShouldAnnounceCountdown throttles far-out announcements (expected false)"); }
 
-		int iResult = PickWarnThreshold(thresholds, 999999, 45);
-		if (iResult == 60) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold selects the first crossed tier"); }
-		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold selects the first crossed tier (expected 60, got %d)", iResult); }
+		bResult = ShouldAnnounceCountdown(45, 15, 0.0, 700.0, 600, 60);
+		if (bResult) { iPass++; ReplyToCommand(client, "[PASS] ShouldAnnounceCountdown fires again once the far interval elapses"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ShouldAnnounceCountdown fires again once the far interval elapses (expected true)"); }
+	}
 
-		iResult = PickWarnThreshold(thresholds, 60, 25);
-		if (iResult == 30) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold advances to the next tier"); }
-		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold advances to the next tier (expected 30, got %d)", iResult); }
+	// ShouldAnnounceCountdown switches to the short "close" spacing so it fires on
+	// effectively every map once inside the warn-close window.
+	{
+		bool bResult = ShouldAnnounceCountdown(10, 15, 0.0, 90.0, 600, 60);
+		if (bResult) { iPass++; ReplyToCommand(client, "[PASS] ShouldAnnounceCountdown uses the short interval once close"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ShouldAnnounceCountdown uses the short interval once close (expected true)"); }
 
-		iResult = PickWarnThreshold(thresholds, 30, 50);
-		if (iResult == -1) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold does not re-fire an already-passed tier"); }
-		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold does not re-fire an already-passed tier (expected -1, got %d)", iResult); }
-
-		delete thresholds;
+		bResult = ShouldAnnounceCountdown(10, 15, 0.0, 30.0, 600, 60);
+		if (!bResult) { iPass++; ReplyToCommand(client, "[PASS] ShouldAnnounceCountdown still respects the short interval floor"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ShouldAnnounceCountdown still respects the short interval floor (expected false)"); }
 	}
 
 	ReplyToCommand(client, "[FixMemoryLeak] Selftest complete: %d passed, %d failed.", iPass, iFail);
@@ -711,18 +708,19 @@ stock void SetNextRestart(int iNextTime, const char[] sMap)
 	else
 		LogError("[FixMemoryLeak] Failed to persist next restart (%d, map=%s).", iNextTime, sMap);
 
-	// New target time: re-arm the staged countdown warnings.
-	g_iLastWarnedThreshold = 999999;
+	// New target time: let the next check announce it right away.
 	g_flLastWarnTime = 0.0;
 	g_bNextMapSet = true;
 }
 
 /**
- * Staged countdown announcements. Far from the restart, we announce once per
- * configured threshold (sm_restart_warn_thresholds). Once inside the
- * sm_restart_warn_close window, we announce on every map instead, throttled only
- * by sm_restart_warn_min_interval so a map-start and a round-end check can't both
- * fire in the same breath.
+ * Countdown announcements always show the *live* remaining time ("restart in 23
+ * minutes", then 22, 21, ... on whichever maps happen to land on a check), rather
+ * than snapping to a fixed list of checkpoints - a fixed-checkpoint design would
+ * silently skip announcing on any map that doesn't land exactly on one. Spacing is
+ * controlled purely by a minimum interval: a long one while far from the restart
+ * (so it doesn't fire on every single map), and a short one once inside
+ * sm_restart_warn_close (so it effectively does fire on every map).
  */
 stock void CheckAndAnnounceCountdown()
 {
@@ -736,78 +734,22 @@ stock void CheckAndAnnounceCountdown()
 	int iRemainingMin = RoundToCeil(float(iRemainingSec) / 60.0);
 	float flNow = GetEngineTime();
 
-	if (iRemainingMin <= g_iWarnClose)
-	{
-		if (flNow - g_flLastWarnTime < float(g_iWarnMinInterval))
-			return;
-
-		AnnounceCountdown(iRemainingMin);
-		g_flLastWarnTime = flNow;
+	if (!ShouldAnnounceCountdown(iRemainingMin, g_iWarnClose, g_flLastWarnTime, flNow, g_iWarnInterval, g_iWarnCloseInterval))
 		return;
-	}
 
-	int iThreshold = PickWarnThreshold(g_iWarnThresholds, g_iLastWarnedThreshold, iRemainingMin);
-	if (iThreshold > 0)
-	{
-		AnnounceCountdown(iThreshold);
-		g_iLastWarnedThreshold = iThreshold;
-		g_flLastWarnTime = flNow;
-	}
+	AnnounceCountdown(iRemainingMin);
+	g_flLastWarnTime = flNow;
 }
 
-stock int PickWarnThreshold(ArrayList thresholds, int iLastWarned, int iRemainingMin)
+stock bool ShouldAnnounceCountdown(int iRemainingMin, int iWarnCloseMin, float flLastWarn, float flNow, int iFarIntervalSec, int iCloseIntervalSec)
 {
-	if (thresholds == null)
-		return -1;
-
-	for (int i = 0; i < thresholds.Length; i++)
-	{
-		int iThreshold = thresholds.Get(i);
-
-		if (iThreshold >= iLastWarned)
-			continue;
-
-		if (iRemainingMin <= iThreshold)
-			return iThreshold;
-	}
-
-	return -1;
+	int iRequiredInterval = (iRemainingMin <= iWarnCloseMin) ? iCloseIntervalSec : iFarIntervalSec;
+	return (flNow - flLastWarn) >= float(iRequiredInterval);
 }
 
 stock void AnnounceCountdown(int iMinutes)
 {
 	CPrintToChatAll("%t %t", "Prefix", "Restart Countdown", iMinutes);
-}
-
-stock void ParseWarnThresholds()
-{
-	if (g_iWarnThresholds != null)
-		delete g_iWarnThresholds;
-	g_iWarnThresholds = new ArrayList();
-
-	char sValue[128];
-	g_cWarnThresholds.GetString(sValue, sizeof(sValue));
-
-	char sParts[32][16];
-	int iCount = ExplodeString(sValue, ",", sParts, sizeof(sParts), sizeof(sParts[]));
-
-	for (int i = 0; i < iCount; i++)
-	{
-		TrimString(sParts[i]);
-		if (sParts[i][0] == '\0')
-			continue;
-
-		int iMinutes = StringToInt(sParts[i]);
-		if (iMinutes <= 0)
-		{
-			LogError("[FixMemoryLeak] Ignoring invalid entry '%s' in sm_restart_warn_thresholds.", sParts[i]);
-			continue;
-		}
-
-		g_iWarnThresholds.Push(iMinutes);
-	}
-
-	SortADTArray(g_iWarnThresholds, Sort_Descending, Sort_Integer);
 }
 
 stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart, int iNow)
