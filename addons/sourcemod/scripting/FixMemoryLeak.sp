@@ -19,7 +19,7 @@ public Plugin myinfo =
 	name = "FixMemoryLeak",
 	author = "maxime1907, .Rushaway",
 	description = "Fix memory leaks resulting in crashes by restarting the server at a given time.",
-	version = "1.4.0",
+	version = "1.5.0",
 	url = "https://github.com/srcdslab"
 }
 
@@ -33,8 +33,11 @@ enum struct ConfiguredRestart
 ConVar g_cRestartMode, g_cRestartDelay;
 ConVar g_cMaxPlayers, g_cMaxPlayersCountBots;
 ConVar g_cvEarlySvRestart;
+ConVar g_cMinUptime, g_cCooldown;
+ConVar g_cWarnThresholds, g_cWarnClose, g_cWarnMinInterval;
 
 ArrayList g_iConfiguredRestarts = null;
+ArrayList g_iWarnThresholds = null;
 
 bool g_bLate = false;
 bool g_bDebug = false;
@@ -48,6 +51,24 @@ static bool g_bCmdsAlreadyExecuted = false;
 int g_iMode;
 int g_iDelay;
 int g_iMaxPlayers;
+int g_iMinUptime;
+int g_iCooldown;
+int g_iWarnClose;
+int g_iWarnMinInterval;
+
+// Runtime restart state, cached in memory and mirrored to the "info" section of
+// CONFIG_PATH. Reads never hit disk; writes go through WriteRuntimeState() which is
+// atomic (temp file + validated reimport + rename).
+int g_iNextRestartTime = 0;
+char g_sNextRestartMap[PLATFORM_MAX_PATH] = "";
+bool g_bStateRestarted = false;
+bool g_bStateChanged = false;
+int g_iLastRestartTime = 0;
+
+// Staged countdown warning bookkeeping (in-memory only, re-armed whenever the
+// restart target time changes via SetNextRestart()).
+int g_iLastWarnedThreshold = 999999;
+float g_flLastWarnTime = 0.0;
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
 {
@@ -66,6 +87,11 @@ public void OnPluginStart()
 	g_cMaxPlayers = CreateConVar("sm_restart_maxplayers", "-1", "How many players should be connected to cancel restart (-1 = Disable)", FCVAR_NOTIFY, true, -1.0, true, float(MAXPLAYERS));
 	g_cMaxPlayersCountBots = CreateConVar("sm_restart_maxplayers_count_bots", "0", "Should we count bots for sm_restart_maxplayers (1 = Enabled, 0 = Disabled)", FCVAR_NOTIFY, true, 0.0, true, 1.0);
 	g_cvEarlySvRestart = CreateConVar("sm_fixmemoryleak_early_restart", "1", "Early restart if no players are connected. (sm_restart_delay / 2)", FCVAR_NOTIFY, true, 0.0, true, 1.0);
+	g_cMinUptime = CreateConVar("sm_restart_min_uptime", "10", "Safety floor: an automatic restart may never be scheduled less than this many minutes from now, regardless of mode/schedule.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
+	g_cCooldown = CreateConVar("sm_restart_cooldown", "10", "Safety floor: minimum minutes between two automatic restarts. Guarantees the plugin can never restart on every map in a row, even if the schedule/state is wrong. 0 = disabled.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
+	g_cWarnThresholds = CreateConVar("sm_restart_warn_thresholds", "60,30,15,10,5,2,1", "Comma-separated list of minutes-before-restart at which to announce a one-time countdown warning.", FCVAR_NOTIFY);
+	g_cWarnClose = CreateConVar("sm_restart_warn_close", "15", "Below this many minutes remaining, announce the countdown on every map (throttled by sm_restart_warn_min_interval) instead of once per threshold.", FCVAR_NOTIFY, true, 0.0, true, 1440.0);
+	g_cWarnMinInterval = CreateConVar("sm_restart_warn_min_interval", "180", "Minimum seconds between two countdown announcements while inside the sm_restart_warn_close window.", FCVAR_NOTIFY, true, 0.0, true, 3600.0);
 
 	// Hook CVARs
 	HookConVarChange(g_cRestartMode, OnCvarChanged);
@@ -73,6 +99,11 @@ public void OnPluginStart()
 	HookConVarChange(g_cMaxPlayers, OnCvarChanged);
 	HookConVarChange(g_cMaxPlayersCountBots, OnCvarChanged);
 	HookConVarChange(g_cvEarlySvRestart, OnCvarChanged);
+	HookConVarChange(g_cMinUptime, OnCvarChanged);
+	HookConVarChange(g_cCooldown, OnCvarChanged);
+	HookConVarChange(g_cWarnThresholds, OnCvarChanged);
+	HookConVarChange(g_cWarnClose, OnCvarChanged);
+	HookConVarChange(g_cWarnMinInterval, OnCvarChanged);
 
 	// Initialize values
 	g_iMode = g_cRestartMode.IntValue;
@@ -80,6 +111,11 @@ public void OnPluginStart()
 	g_iMaxPlayers = g_cMaxPlayers.IntValue;
 	g_bCountBots = g_cMaxPlayersCountBots.BoolValue;
 	g_bEarlyRestart = g_cvEarlySvRestart.BoolValue;
+	g_iMinUptime = g_cMinUptime.IntValue;
+	g_iCooldown = g_cCooldown.IntValue;
+	g_iWarnClose = g_cWarnClose.IntValue;
+	g_iWarnMinInterval = g_cWarnMinInterval.IntValue;
+	ParseWarnThresholds();
 
 	AutoExecConfig(true);
 
@@ -88,6 +124,7 @@ public void OnPluginStart()
 	RegAdminCmd("sm_svnextrestart", Command_SvNextRestart, ADMFLAG_RCON, "Print time until next restart.");
 	RegAdminCmd("sm_reloadrestartcfg", Command_DebugConfig, ADMFLAG_ROOT, "Reloads the configuration.");
 	RegAdminCmd("sm_forcerestartcmds", Command_ForceRestartCommands, ADMFLAG_ROOT, "Force execution of post-restart commands.");
+	RegAdminCmd("sm_restart_selftest", Command_SelfTest, ADMFLAG_ROOT, "Run built-in self-tests for the restart safety/scheduling logic.");
 
 	RegServerCmd("changelevel", Hook_OnMapChange);
 	RegServerCmd("quit", Hook_OnServerQuit);
@@ -104,6 +141,9 @@ public void OnPluginEnd()
 
 	if (g_iConfiguredRestarts != null)
 		delete g_iConfiguredRestarts;
+
+	if (g_iWarnThresholds != null)
+		delete g_iWarnThresholds;
 }
 
 public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -118,9 +158,16 @@ public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] new
 		g_bCountBots = g_cMaxPlayersCountBots.BoolValue;
 	else if (convar == g_cvEarlySvRestart)
 		g_bEarlyRestart = g_cvEarlySvRestart.BoolValue;
-
-	// Convar get changed, we need to check if we need to update the next restart time
-	OnMapStart();
+	else if (convar == g_cMinUptime)
+		g_iMinUptime = g_cMinUptime.IntValue;
+	else if (convar == g_cCooldown)
+		g_iCooldown = g_cCooldown.IntValue;
+	else if (convar == g_cWarnClose)
+		g_iWarnClose = g_cWarnClose.IntValue;
+	else if (convar == g_cWarnMinInterval)
+		g_iWarnMinInterval = g_cWarnMinInterval.IntValue;
+	else if (convar == g_cWarnThresholds)
+		ParseWarnThresholds();
 }
 
 public void OnMapStart()
@@ -129,19 +176,26 @@ public void OnMapStart()
 	g_bNextMapSet = false;
 
 	LoadConfiguredRestarts();
+	LoadRuntimeState();
 
-	char sSectionValue[PLATFORM_MAX_PATH];
-	if (GetSectionValue(CONFIG_KV_INFO_NAME, "restarted", sSectionValue) && strcmp(sSectionValue, "1") == 0)
+	if (g_bStateRestarted && !g_bStateChanged)
 	{
-		if (GetSectionValue(CONFIG_KV_INFO_NAME, "changed", sSectionValue))
+		// Consume the pending flag immediately, before even attempting the changelevel,
+		// so a bad/invalid persisted nextmap can never cause a retry on every subsequent map.
+		g_bStateChanged = true;
+		WriteRuntimeState();
+
+		if (g_sNextRestartMap[0] && IsMapValid(g_sNextRestartMap))
 		{
-			if (strcmp(sSectionValue, "0") == 0 && GetSectionValue(CONFIG_KV_INFO_NAME, "nextmap", sSectionValue))
-			{
-				SetSectionValue(CONFIG_KV_INFO_NAME, "changed", "1");
-				ForceChangeLevel(sSectionValue, "FixMemoryLeak");
-			}
+			ForceChangeLevel(g_sNextRestartMap, "FixMemoryLeak");
+		}
+		else if (g_sNextRestartMap[0])
+		{
+			LogError("[FixMemoryLeak] Persisted nextmap '%s' is not valid, staying on the current map.", g_sNextRestartMap);
 		}
 	}
+
+	CheckAndAnnounceCountdown();
 }
 
 stock bool LoadCommandsAfterRestart(bool bReload = false)
@@ -158,7 +212,12 @@ stock bool LoadCommandsAfterRestart(bool bReload = false)
 	// }
 
 	KeyValues kv;
-	GetConfigKv(kv);
+	if (!GetConfigKv(kv))
+	{
+		delete kv;
+		return false;
+	}
+
 	if (!kv.JumpToKey(CONFIG_KV_COMMANDS_NAME))
 	{
 		delete kv;
@@ -264,12 +323,12 @@ public Action Command_SvNextRestart(int client, int argc)
 
 			CReplyToCommand(client, "%t %t", "Prefix", "Next Restart", iDays, iHours, iMinsUntilRestart % 60);
 		}
-		case 1,2:
+		case 1, 2:
 		{
 			char buffer[768], rTime[768];
-			int RemaingTime = GetNextRestartTime() - GetTime();
-			FormatTime(buffer, sizeof(buffer), "%A %d %B %G @ %r", GetNextRestartTime());
-			FormatTime(rTime, sizeof(rTime), "%X", RemaingTime);
+			int iRemaining = g_iNextRestartTime - GetTime();
+			FormatTime(buffer, sizeof(buffer), "%A %d %B %G @ %r", g_iNextRestartTime);
+			FormatTime(rTime, sizeof(rTime), "%X", iRemaining);
 
 			CReplyToCommand(client, "%t %t", "Prefix", "Next Restart Time", buffer);
 			CReplyToCommand(client, "%t %t", "Prefix", "Remaining Time", rTime);
@@ -331,6 +390,102 @@ public Action Command_ForceRestartCommands(int client, int args)
 	return Plugin_Handled;
 }
 
+public Action Command_SelfTest(int client, int argc)
+{
+	int iPass = 0, iFail = 0;
+	int iNow = GetTime();
+
+	// ClampToMinUptime floors a time that is already in the past / too close.
+	{
+		int iFloor = iNow + (10 * 60);
+		int iResult = ClampToMinUptime(iNow - 500, 10, iNow);
+		if (iResult == iFloor) { iPass++; ReplyToCommand(client, "[PASS] ClampToMinUptime floors a too-close time"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ClampToMinUptime floors a too-close time (expected %d, got %d)", iFloor, iResult); }
+	}
+
+	// ClampToMinUptime leaves a far-future time untouched.
+	{
+		int iFuture = iNow + 99999;
+		int iResult = ClampToMinUptime(iFuture, 10, iNow);
+		if (iResult == iFuture) { iPass++; ReplyToCommand(client, "[PASS] ClampToMinUptime keeps a far-future time"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] ClampToMinUptime keeps a far-future time (expected %d, got %d)", iFuture, iResult); }
+	}
+
+	// IsCooldownActive gates a very recent restart.
+	{
+		bool bResult = IsCooldownActive(iNow - 30, 10, iNow);
+		if (bResult) { iPass++; ReplyToCommand(client, "[PASS] IsCooldownActive blocks right after a restart"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] IsCooldownActive blocks right after a restart (expected true)"); }
+	}
+
+	// IsCooldownActive releases once the cooldown window has passed.
+	{
+		bool bResult = IsCooldownActive(iNow - 700, 10, iNow);
+		if (!bResult) { iPass++; ReplyToCommand(client, "[PASS] IsCooldownActive releases after the window"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] IsCooldownActive releases after the window (expected false)"); }
+	}
+
+	// IsCooldownActive never blocks when no restart has ever happened.
+	{
+		bool bResult = IsCooldownActive(0, 10, iNow);
+		if (!bResult) { iPass++; ReplyToCommand(client, "[PASS] IsCooldownActive is inactive with no prior restart"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] IsCooldownActive is inactive with no prior restart (expected false)"); }
+	}
+
+	// GetConfiguredRestartTime lands on the configured day/hour/minute, strictly in the future,
+	// and never more than 7 days out (catches a runaway day-diff calculation).
+	{
+		ConfiguredRestart cr;
+		cr.iDay = 3;
+		cr.iHour = 14;
+		cr.iMinute = 30;
+
+		int iResult = GetConfiguredRestartTime(cr, iNow);
+
+		char sBuf[8];
+		FormatTime(sBuf, sizeof(sBuf), "%u", iResult);
+		int iResultDay = StringToInt(sBuf);
+		FormatTime(sBuf, sizeof(sBuf), "%H", iResult);
+		int iResultHour = StringToInt(sBuf);
+		FormatTime(sBuf, sizeof(sBuf), "%M", iResult);
+		int iResultMinute = StringToInt(sBuf);
+
+		bool bOk = (iResult > iNow)
+			&& (iResultDay == cr.iDay)
+			&& (iResultHour == cr.iHour)
+			&& (iResultMinute == cr.iMinute)
+			&& ((iResult - iNow) <= 7 * 24 * 60 * 60);
+
+		if (bOk) { iPass++; ReplyToCommand(client, "[PASS] GetConfiguredRestartTime lands on the configured day/hour/minute"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] GetConfiguredRestartTime lands on the configured day/hour/minute (got day=%d hour=%d min=%d, now=%d, result=%d)", iResultDay, iResultHour, iResultMinute, iNow, iResult); }
+	}
+
+	// PickWarnThreshold selects the largest crossed, not-yet-announced tier.
+	{
+		ArrayList thresholds = new ArrayList();
+		thresholds.Push(60);
+		thresholds.Push(30);
+		thresholds.Push(15);
+
+		int iResult = PickWarnThreshold(thresholds, 999999, 45);
+		if (iResult == 60) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold selects the first crossed tier"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold selects the first crossed tier (expected 60, got %d)", iResult); }
+
+		iResult = PickWarnThreshold(thresholds, 60, 25);
+		if (iResult == 30) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold advances to the next tier"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold advances to the next tier (expected 30, got %d)", iResult); }
+
+		iResult = PickWarnThreshold(thresholds, 30, 50);
+		if (iResult == -1) { iPass++; ReplyToCommand(client, "[PASS] PickWarnThreshold does not re-fire an already-passed tier"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] PickWarnThreshold does not re-fire an already-passed tier (expected -1, got %d)", iResult); }
+
+		delete thresholds;
+	}
+
+	ReplyToCommand(client, "[FixMemoryLeak] Selftest complete: %d passed, %d failed.", iPass, iFail);
+	return Plugin_Handled;
+}
+
 stock int GetClientCountEx(bool countBots)
 {
 	int iRealClients = 0;
@@ -352,7 +507,10 @@ stock int GetClientCountEx(bool countBots)
 public Action OnRoundEnd(Handle event, const char[] name, bool dontBroadcast)
 {
 	if (!IsRestartNeeded())
+	{
+		CheckAndAnnounceCountdown();
 		return Plugin_Continue;
+	}
 
 	int timeleft;
 	int playersCount = GetClientCountEx(g_bCountBots);
@@ -394,12 +552,31 @@ public Action OnRoundEnd(Handle event, const char[] name, bool dontBroadcast)
 	return Plugin_Continue;
 }
 
+/**
+ * Anti-loop safety nets. These are intentionally independent from the mode 0/1/2
+ * scheduling logic below: even if that logic (or a corrupted/stale persisted state)
+ * says "restart now", these two checks guarantee the plugin can never restart the
+ * server on every single map change.
+ */
+stock int ClampToMinUptime(int iTime, int iMinUptimeMinutes, int iNow)
+{
+	int iFloor = iNow + (iMinUptimeMinutes * 60);
+	return (iTime < iFloor) ? iFloor : iTime;
+}
+
+stock bool IsCooldownActive(int iLastRestart, int iCooldownMinutes, int iNow)
+{
+	return iLastRestart > 0 && (iNow - iLastRestart) < (iCooldownMinutes * 60);
+}
+
 stock bool IsRestartNeeded()
 {
-	bool bHasPlayers = false;
 	int currentTime = GetTime();
-	int iTime = g_iDelay;
 
+	if (IsCooldownActive(g_iLastRestartTime, g_iCooldown, currentTime))
+		return false;
+
+	bool bHasPlayers = false;
 	if (g_bEarlyRestart)
 	{
 		for (int i = 1; i <= MaxClients; i++)
@@ -417,26 +594,34 @@ stock bool IsRestartNeeded()
 		case 0:
 		{
 			int iUptime = CalculateUptime();
+			int iTime = g_iDelay;
+
 			if (g_bEarlyRestart && !bHasPlayers)
-				iTime = iTime / 2;
+				iTime /= 2;
+
+			if (iTime < g_iMinUptime)
+				iTime = g_iMinUptime;
 
 			return iUptime >= iTime;
 		}
-		case 1,2:
+		case 1, 2:
 		{
-			char sSectionValue[PLATFORM_MAX_PATH];
-			if (GetSectionValue(CONFIG_KV_INFO_NAME, "nextrestart", sSectionValue))
-			{
-				iTime = StringToInt(sSectionValue);
-				if (g_bEarlyRestart && !bHasPlayers)
-					iTime = iTime / 2;
-
-				return currentTime >= iTime;
-			}
-			else
+			if (g_iNextRestartTime <= 0)
 			{
 				SetupNextRestartNextMap("");
+				return false;
 			}
+
+			int iTime = g_iNextRestartTime;
+
+			if (g_bEarlyRestart && !bHasPlayers)
+			{
+				// Halve the *remaining* time, not the absolute timestamp.
+				int iHalvedRemaining = currentTime + ((iTime - currentTime) / 2);
+				iTime = ClampToMinUptime(iHalvedRemaining, g_iMinUptime, currentTime);
+			}
+
+			return currentTime >= iTime;
 		}
 	}
 
@@ -446,15 +631,19 @@ stock bool IsRestartNeeded()
 stock void SoftServerRestart()
 {
 	g_bRestart = true;
-	int iNextTime = GetNextRestartTime();
 
-	char sNextTime[64];
-	IntToString(iNextTime, sNextTime, sizeof(sNextTime));
+	int iNow = GetTime();
+	g_iLastRestartTime = iNow;
+	g_iNextRestartTime = GetNextRestartTime(iNow);
+	g_bStateRestarted = true;
+	g_bStateChanged = false;
 
-	// We need to set the next restart time before restarting the server to prevent infinite loop
-	// This value will be updated later in SetNextRestart()
-	SetSectionValue(CONFIG_KV_INFO_NAME, "nextrestart", sNextTime);
-	SetSectionValue(CONFIG_KV_INFO_NAME, "restarted", "1");
+	// We need to persist the (future) next restart time and the "restarted" flag before
+	// actually quitting, so that if the process comes back up before this timestamp is
+	// reached again, IsRestartNeeded()/IsCooldownActive() both refuse to fire immediately.
+	if (!WriteRuntimeState())
+		LogError("[FixMemoryLeak] Failed to persist restart state before quitting - the server may not land on the intended nextmap after relaunch.");
+
 	ReconnectPlayers();
 	RequestFrame(RestartServer);
 }
@@ -471,22 +660,15 @@ stock void ReconnectPlayers()
 public void RestartServer()
 {
 	ServerCommand("quit");
-	// InsertServerCommand("quit");
-	// ServerExecute();
 }
 
 stock void SetupNextRestartCurrentMap(bool bForce = false)
 {
-	char sNextMap[PLATFORM_MAX_PATH];
-	GetCurrentMap(sNextMap, sizeof(sNextMap));
+	char sMap[PLATFORM_MAX_PATH];
+	GetCurrentMap(sMap, sizeof(sMap));
 
-	int iNextTime;
-	if (bForce)
-		iNextTime = GetTime();
-	else
-		iNextTime = GetNextRestartTime();
-
-	SetNextRestart(iNextTime, sNextMap);
+	int iNextTime = bForce ? GetTime() : GetNextRestartTime(GetTime());
+	SetNextRestart(iNextTime, sMap);
 }
 
 stock void SetupNextRestartNextMap(const char[] map)
@@ -495,54 +677,143 @@ stock void SetupNextRestartNextMap(const char[] map)
 	if (g_bNextMapSet)
 		return;
 
-	PrintToServer("[FixMemoryLeak] Setting nextmap..");
-
 	char sNextMap[PLATFORM_MAX_PATH];
-	FormatEx(sNextMap, sizeof(sNextMap), map);
+	strcopy(sNextMap, sizeof(sNextMap), map);
 
-	if (!sNextMap[0])
+	if (!sNextMap[0] && !GetNextMap(sNextMap, sizeof(sNextMap)))
 	{
-		if (!GetNextMap(sNextMap, sizeof(sNextMap)))
-		{
-			LogMessage("Could not get the nextmap. Attempting to get nextmap via convar.");
-			ConVar cvar = FindConVar("sm_nextmap");
-			if (cvar != INVALID_HANDLE)
-				GetConVarString(cvar, sNextMap, sizeof(sNextMap));
-		}
-
-		// Final check: Is the nextmap still empty?
-		if (!sNextMap[0])
-		{
-			LogError("Could not find the nextmap.. Fallback on the currentmap.");
-			SetupNextRestartCurrentMap();
-			return;
-		}
+		ConVar cvar = FindConVar("sm_nextmap");
+		if (cvar != null)
+			cvar.GetString(sNextMap, sizeof(sNextMap));
 	}
 
-	int iNextTime = GetNextRestartTime();
-	SetNextRestart(iNextTime, sNextMap);
+	if (!sNextMap[0] || !IsMapValid(sNextMap))
+	{
+		if (sNextMap[0])
+			LogError("[FixMemoryLeak] Resolved nextmap '%s' is invalid, falling back to current map.", sNextMap);
+
+		SetupNextRestartCurrentMap();
+		return;
+	}
+
+	SetNextRestart(GetNextRestartTime(GetTime()), sNextMap);
 }
 
-stock void SetNextRestart(int iNextTime, char sNextMap[PLATFORM_MAX_PATH])
+stock void SetNextRestart(int iNextTime, const char[] sMap)
 {
-	char sNextTime[64];
-	IntToString(iNextTime, sNextTime, sizeof(sNextTime));
+	g_iNextRestartTime = iNextTime;
+	strcopy(g_sNextRestartMap, sizeof(g_sNextRestartMap), sMap);
+	g_bStateRestarted = false;
+	g_bStateChanged = false;
 
-	SetSectionValue(CONFIG_KV_INFO_NAME, "nextrestart", sNextTime);
-	SetSectionValue(CONFIG_KV_INFO_NAME, "nextmap", sNextMap);
-	SetSectionValue(CONFIG_KV_INFO_NAME, "restarted", "0");
-	SetSectionValue(CONFIG_KV_INFO_NAME, "changed", "0");
+	if (WriteRuntimeState())
+		LogMessage("Next restart set at %d on %s", iNextTime, sMap);
+	else
+		LogError("[FixMemoryLeak] Failed to persist next restart (%d, map=%s).", iNextTime, sMap);
 
-	LogMessage("Next restart set at %s on %s", sNextTime, sNextMap);
+	// New target time: re-arm the staged countdown warnings.
+	g_iLastWarnedThreshold = 999999;
+	g_flLastWarnTime = 0.0;
 	g_bNextMapSet = true;
 }
 
-stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart)
+/**
+ * Staged countdown announcements. Far from the restart, we announce once per
+ * configured threshold (sm_restart_warn_thresholds). Once inside the
+ * sm_restart_warn_close window, we announce on every map instead, throttled only
+ * by sm_restart_warn_min_interval so a map-start and a round-end check can't both
+ * fire in the same breath.
+ */
+stock void CheckAndAnnounceCountdown()
 {
-	int iCurrentTime = GetTime();
+	if (g_bPostponeRestart || g_iNextRestartTime <= 0)
+		return;
 
+	int iRemainingSec = g_iNextRestartTime - GetTime();
+	if (iRemainingSec <= 0)
+		return;
+
+	int iRemainingMin = RoundToCeil(float(iRemainingSec) / 60.0);
+	float flNow = GetEngineTime();
+
+	if (iRemainingMin <= g_iWarnClose)
+	{
+		if (flNow - g_flLastWarnTime < float(g_iWarnMinInterval))
+			return;
+
+		AnnounceCountdown(iRemainingMin);
+		g_flLastWarnTime = flNow;
+		return;
+	}
+
+	int iThreshold = PickWarnThreshold(g_iWarnThresholds, g_iLastWarnedThreshold, iRemainingMin);
+	if (iThreshold > 0)
+	{
+		AnnounceCountdown(iThreshold);
+		g_iLastWarnedThreshold = iThreshold;
+		g_flLastWarnTime = flNow;
+	}
+}
+
+stock int PickWarnThreshold(ArrayList thresholds, int iLastWarned, int iRemainingMin)
+{
+	if (thresholds == null)
+		return -1;
+
+	for (int i = 0; i < thresholds.Length; i++)
+	{
+		int iThreshold = thresholds.Get(i);
+
+		if (iThreshold >= iLastWarned)
+			continue;
+
+		if (iRemainingMin <= iThreshold)
+			return iThreshold;
+	}
+
+	return -1;
+}
+
+stock void AnnounceCountdown(int iMinutes)
+{
+	CPrintToChatAll("%t %t", "Prefix", "Restart Countdown", iMinutes);
+}
+
+stock void ParseWarnThresholds()
+{
+	if (g_iWarnThresholds != null)
+		delete g_iWarnThresholds;
+	g_iWarnThresholds = new ArrayList();
+
+	char sValue[128];
+	g_cWarnThresholds.GetString(sValue, sizeof(sValue));
+
+	char sParts[32][16];
+	int iCount = ExplodeString(sValue, ",", sParts, sizeof(sParts), sizeof(sParts[]));
+
+	for (int i = 0; i < iCount; i++)
+	{
+		TrimString(sParts[i]);
+		if (sParts[i][0] == '\0')
+			continue;
+
+		int iMinutes = StringToInt(sParts[i]);
+		if (iMinutes <= 0)
+		{
+			LogError("[FixMemoryLeak] Ignoring invalid entry '%s' in sm_restart_warn_thresholds.", sParts[i]);
+			continue;
+		}
+
+		g_iWarnThresholds.Push(iMinutes);
+	}
+
+	SortADTArray(g_iWarnThresholds, Sort_Descending, Sort_Integer);
+}
+
+stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart, int iNow)
+{
 	char sBuffer[10];
-	FormatTime(sBuffer, sizeof(sBuffer), "%u", iCurrentTime);
+	FormatTime(sBuffer, sizeof(sBuffer), "%u", iNow);
 	int iCurrentDay = StringToInt(sBuffer);
 
 	int iDiff;
@@ -551,8 +822,8 @@ stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart)
 	else
 		iDiff = configuredRestart.iDay - iCurrentDay;
 
-	int iTime = iCurrentTime;
-	iTime += iDiff * (24*60*60);
+	int iTime = iNow;
+	iTime += iDiff * (24 * 60 * 60);
 
 	FormatTime(sBuffer, sizeof(sBuffer), "%H", iTime);
 	int iCurrentHour = StringToInt(sBuffer);
@@ -560,19 +831,19 @@ stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart)
 	FormatTime(sBuffer, sizeof(sBuffer), "%M", iTime);
 	int iCurrentMinute = StringToInt(sBuffer);
 
-	iTime -= iCurrentHour * (60*60);
+	iTime -= iCurrentHour * (60 * 60);
 	iTime -= iCurrentMinute * (60);
 
-	iTime += configuredRestart.iHour * (60*60);
+	iTime += configuredRestart.iHour * (60 * 60);
 	iTime += configuredRestart.iMinute * (60);
 
-	if (iTime <= iCurrentTime)
-		iTime += 7 * (24*60*60);
+	if (iTime <= iNow)
+		iTime += 7 * (24 * 60 * 60);
 
 	return iTime;
 }
 
-stock int GetConfiguredClosestTime()
+stock int GetConfiguredClosestTime(int iNow)
 {
 	int iNextTime = 0;
 
@@ -584,29 +855,22 @@ stock int GetConfiguredClosestTime()
 		ConfiguredRestart configuredRestart;
 		g_iConfiguredRestarts.GetArray(i, configuredRestart, sizeof(configuredRestart));
 
-		int iConfiguredRestartTime = GetConfiguredRestartTime(configuredRestart);
+		int iConfiguredRestartTime = GetConfiguredRestartTime(configuredRestart, iNow);
 
 		if (g_bDebug)
 			CPrintToChatAll("Timestamp => %d", iConfiguredRestartTime);
 
-		if (i == 0)
-		{
-			iNextTime = iConfiguredRestartTime;
-			continue;
-		}
-
-		if (iConfiguredRestartTime < iNextTime)
+		if (i == 0 || iConfiguredRestartTime < iNextTime)
 			iNextTime = iConfiguredRestartTime;
 	}
 
 	return iNextTime;
 }
 
-stock int GetNextRestartTime()
+stock int GetNextRestartTime(int iNow)
 {
 	int iNextTime = 0;
-	int currentTime = GetTime();
-	int iDelayTime = currentTime + (g_iDelay * 60);
+	int iDelayTime = iNow + (g_iDelay * 60);
 
 	switch (g_iMode)
 	{
@@ -616,75 +880,223 @@ stock int GetNextRestartTime()
 		}
 		case 1:
 		{
-			iNextTime = GetConfiguredClosestTime();
+			iNextTime = GetConfiguredClosestTime(iNow);
 		}
 		case 2:
 		{
-			int iConfiguredTime = GetConfiguredClosestTime();
-			if (iConfiguredTime > iDelayTime)
-				iNextTime = iDelayTime;
-			else
-				iNextTime = iConfiguredTime;
+			int iConfiguredTime = GetConfiguredClosestTime(iNow);
+			iNextTime = (iConfiguredTime > 0 && iConfiguredTime < iDelayTime) ? iConfiguredTime : iDelayTime;
 		}
 	}
 
 	if (iNextTime <= 0)
 		iNextTime = iDelayTime;
 
-	return iNextTime;
+	return ClampToMinUptime(iNextTime, g_iMinUptime, iNow);
 }
 
-stock void GetConfigKv(KeyValues &kv, const char[] sConfigPath = CONFIG_PATH, const char[] sKvName = CONFIG_KV_NAME)
+/**
+ * Config file handling. CONFIG_PATH holds three sections:
+ *  - "commands": admin-authored, executed once after a restart-triggered relaunch.
+ *  - "restart":  admin-authored weekly schedule (day 1-7 ISO, Monday=1..Sunday=7).
+ *  - "info":     plugin-owned runtime state, mirrored in g_iNextRestartTime/etc and
+ *                only ever written through WriteRuntimeState() (atomic).
+ * A missing or corrupted file is regenerated with safe defaults; a corrupted file is
+ * first backed up (".corrupt-<timestamp>") so nothing is silently lost.
+ */
+stock bool GetConfigKv(KeyValues &kv)
 {
-	kv = new KeyValues(sKvName);
+	kv = new KeyValues(CONFIG_KV_NAME);
 
 	char sFile[PLATFORM_MAX_PATH];
-	BuildPath(Path_SM, sFile, sizeof(sFile), sConfigPath);
+	BuildPath(Path_SM, sFile, sizeof(sFile), CONFIG_PATH);
 
-	if (!FileExists(sFile))
+	if (FileExists(sFile) && kv.ImportFromFile(sFile))
+		return true;
+
+	if (FileExists(sFile))
 	{
-		Handle hFile = OpenFile(sFile, "w");
+		char sBackup[PLATFORM_MAX_PATH];
+		FormatEx(sBackup, sizeof(sBackup), "%s.corrupt-%d", sFile, GetTime());
 
-		if (hFile == INVALID_HANDLE)
-		{
-			SetFailState("Could not create %s", sFile);
-			delete kv;
-			return;
-		}
-
-		WriteFileLine(hFile, "\"%s\"", CONFIG_KV_NAME);
-		WriteFileLine(hFile, "{");
-
-		WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_COMMANDS_NAME);
-		WriteFileLine(hFile, "\t{");
-		WriteFileLine(hFile, "\t\t\"cmd\"\t\"\"");
-		WriteFileLine(hFile, "\t\t\"cmd\"\t\"\"");
-		WriteFileLine(hFile, "\t}");
-
-		WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_INFO_NAME);
-		WriteFileLine(hFile, "\t{");
-		WriteFileLine(hFile, "\t\t\"nextrestart\"\t\"\"");
-		WriteFileLine(hFile, "\t\t\"nextmap\"\t\"\"");
-		WriteFileLine(hFile, "\t\t\"restarted\"\t\"\"");
-		WriteFileLine(hFile, "\t\t\"changed\"\t\"\"");
-		WriteFileLine(hFile, "\t}");
-
-		WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_RESTART_NAME);
-		WriteFileLine(hFile, "\t{");
-		WriteFileLine(hFile, "\t\t\"%s\"", "0");
-		WriteFileLine(hFile, "\t\t{");
-		WriteFileLine(hFile, "\t\t\t\"day\"\t\t\"\"");
-		WriteFileLine(hFile, "\t\t\t\"hour\"\t\t\"\"");
-		WriteFileLine(hFile, "\t\t\t\"minute\"\t\"\"");
-		WriteFileLine(hFile, "\t\t}");
-		WriteFileLine(hFile, "\t}");
-
-		WriteFileLine(hFile, "}");
-
-		CloseHandle(hFile);
+		if (RenameFile(sBackup, sFile))
+			LogError("[FixMemoryLeak] Config file was unreadable, backed up to '%s' and regenerating defaults.", sBackup);
+		else
+			LogError("[FixMemoryLeak] Config file was unreadable and could not be backed up; overwriting with defaults.");
 	}
 
-	kv.ImportFromFile(sFile);
+	WriteDefaultConfig(sFile);
+
+	delete kv;
+	kv = new KeyValues(CONFIG_KV_NAME);
+
+	if (!kv.ImportFromFile(sFile))
+	{
+		LogError("[FixMemoryLeak] CRITICAL: unable to create a usable config at %s.", sFile);
+		delete kv;
+		kv = null;
+		return false;
+	}
+
+	return true;
+}
+
+stock bool WriteDefaultConfig(const char[] sFile)
+{
+	Handle hFile = OpenFile(sFile, "w");
+
+	if (hFile == INVALID_HANDLE)
+	{
+		LogError("[FixMemoryLeak] Could not create default config at %s", sFile);
+		return false;
+	}
+
+	WriteFileLine(hFile, "\"%s\"", CONFIG_KV_NAME);
+	WriteFileLine(hFile, "{");
+
+	WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_COMMANDS_NAME);
+	WriteFileLine(hFile, "\t{");
+	WriteFileLine(hFile, "\t\t\"cmd\"\t\"\"");
+	WriteFileLine(hFile, "\t\t\"cmd\"\t\"\"");
+	WriteFileLine(hFile, "\t}");
+
+	WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_INFO_NAME);
+	WriteFileLine(hFile, "\t{");
+	WriteFileLine(hFile, "\t\t\"nextrestart\"\t\"0\"");
+	WriteFileLine(hFile, "\t\t\"nextmap\"\t\"\"");
+	WriteFileLine(hFile, "\t\t\"restarted\"\t\"0\"");
+	WriteFileLine(hFile, "\t\t\"changed\"\t\"0\"");
+	WriteFileLine(hFile, "\t\t\"lastrestart\"\t\"0\"");
+	WriteFileLine(hFile, "\t}");
+
+	// "day" is ISO-8601 (1=Monday .. 7=Sunday), "hour" is 0-23, "minute" is 0-59.
+	// Leave "day" empty to disable this slot, or add more numbered blocks for more slots.
+	WriteFileLine(hFile, "\t\"%s\"", CONFIG_KV_RESTART_NAME);
+	WriteFileLine(hFile, "\t{");
+	WriteFileLine(hFile, "\t\t\"0\"");
+	WriteFileLine(hFile, "\t\t{");
+	WriteFileLine(hFile, "\t\t\t\"day\"\t\t\"\"");
+	WriteFileLine(hFile, "\t\t\t\"hour\"\t\t\"\"");
+	WriteFileLine(hFile, "\t\t\t\"minute\"\t\"\"");
+	WriteFileLine(hFile, "\t\t}");
+	WriteFileLine(hFile, "\t}");
+
+	WriteFileLine(hFile, "}");
+
+	CloseHandle(hFile);
+	return true;
+}
+
+stock bool ExportConfigAtomic(KeyValues kv)
+{
+	char sFile[PLATFORM_MAX_PATH], sTmp[PLATFORM_MAX_PATH];
+	BuildPath(Path_SM, sFile, sizeof(sFile), CONFIG_PATH);
+	FormatEx(sTmp, sizeof(sTmp), "%s.tmp", sFile);
+
+	if (!kv.ExportToFile(sTmp))
+		return false;
+
+	// Validate the temp file actually parses before trusting it over the live config.
+	KeyValues kvCheck = new KeyValues(CONFIG_KV_NAME);
+	bool bValid = kvCheck.ImportFromFile(sTmp);
+	delete kvCheck;
+
+	if (!bValid)
+	{
+		DeleteFile(sTmp);
+		return false;
+	}
+
+	if (!RenameFile(sFile, sTmp))
+	{
+		DeleteFile(sTmp);
+		return false;
+	}
+
+	return true;
+}
+
+stock void LoadRuntimeState()
+{
+	g_iNextRestartTime = 0;
+	g_sNextRestartMap[0] = '\0';
+	g_bStateRestarted = false;
+	g_bStateChanged = false;
+	g_iLastRestartTime = 0;
+
+	KeyValues kv;
+	if (!GetConfigKv(kv))
+	{
+		delete kv;
+		return;
+	}
+
+	if (!kv.JumpToKey(CONFIG_KV_INFO_NAME))
+	{
+		delete kv;
+		return;
+	}
+
+	char sValue[PLATFORM_MAX_PATH];
+
+	kv.GetString("nextrestart", sValue, sizeof(sValue), "0");
+	g_iNextRestartTime = StringToInt(sValue);
+
+	kv.GetString("nextmap", g_sNextRestartMap, sizeof(g_sNextRestartMap), "");
+
+	kv.GetString("restarted", sValue, sizeof(sValue), "0");
+	g_bStateRestarted = (sValue[0] == '1');
+
+	kv.GetString("changed", sValue, sizeof(sValue), "0");
+	g_bStateChanged = (sValue[0] == '1');
+
+	kv.GetString("lastrestart", sValue, sizeof(sValue), "0");
+	g_iLastRestartTime = StringToInt(sValue);
+
+	delete kv;
+}
+
+stock bool WriteRuntimeState()
+{
+	KeyValues kv;
+	if (!GetConfigKv(kv))
+	{
+		delete kv;
+		return false;
+	}
+
+	if (!kv.JumpToKey(CONFIG_KV_INFO_NAME, true))
+	{
+		LogError("[FixMemoryLeak] Could not access '%s' section while saving restart state.", CONFIG_KV_INFO_NAME);
+		delete kv;
+		return false;
+	}
+
+	char sBuffer[32];
+	IntToString(g_iNextRestartTime, sBuffer, sizeof(sBuffer));
+	kv.SetString("nextrestart", sBuffer);
+	kv.SetString("nextmap", g_sNextRestartMap);
+	kv.SetString("restarted", g_bStateRestarted ? "1" : "0");
+	kv.SetString("changed", g_bStateChanged ? "1" : "0");
+	IntToString(g_iLastRestartTime, sBuffer, sizeof(sBuffer));
+	kv.SetString("lastrestart", sBuffer);
+
+	kv.Rewind();
+
+	bool bSuccess = ExportConfigAtomic(kv);
+	delete kv;
+
+	return bSuccess;
+}
+
+stock void GetDayName(int iDay, char[] sBuffer, int iMaxLen)
+{
+	static char sNames[7][10] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+
+	if (iDay >= 1 && iDay <= 7)
+		strcopy(sBuffer, iMaxLen, sNames[iDay - 1]);
+	else
+		strcopy(sBuffer, iMaxLen, "Invalid");
 }
 
 stock void PrintConfiguredRestarts(int client)
@@ -704,23 +1116,32 @@ stock void PrintConfiguredRestarts(int client)
 	FormatTime(sBuffer, sizeof(sBuffer), "%M", currentTime);
 	int iCurrentMinute = StringToInt(sBuffer);
 
+	char sCurrentDayName[10], sConfiguredDayName[10];
+	GetDayName(iCurrentDay, sCurrentDayName, sizeof(sCurrentDayName));
+
 	for (int i = 0; i < g_iConfiguredRestarts.Length; i++)
 	{
 		ConfiguredRestart configuredRestart;
 
 		g_iConfiguredRestarts.GetArray(i, configuredRestart, sizeof(configuredRestart));
+		GetDayName(configuredRestart.iDay, sConfiguredDayName, sizeof(sConfiguredDayName));
 
-		CPrintToChat(client, "{red}[Debug] {blue}Day : {default}T %d. {green}C %d {default}| {blue}Hour : {default}T %d. {green}C %d {default}| {blue}Minute : {default}T %d. {green}C %d", iCurrentDay, configuredRestart.iDay, iCurrentHour, configuredRestart.iHour, iCurrentMinute, configuredRestart.iMinute);
+		CPrintToChat(client, "{red}[Debug] {blue}Day : {default}T %s. {green}C %s {default}| {blue}Hour : {default}T %d. {green}C %d {default}| {blue}Minute : {default}T %d. {green}C %d", sCurrentDayName, sConfiguredDayName, iCurrentHour, configuredRestart.iHour, iCurrentMinute, configuredRestart.iMinute);
 	}
 }
 
 stock bool LoadConfiguredRestarts(bool bReload = true)
 {
 	KeyValues kv;
-	GetConfigKv(kv);
+	if (!GetConfigKv(kv))
+	{
+		delete kv;
+		return false;
+	}
 
 	if (!kv.JumpToKey(CONFIG_KV_RESTART_NAME))
 	{
+		LogError("[FixMemoryLeak] Config section '%s' missing, no scheduled restarts loaded.", CONFIG_KV_RESTART_NAME);
 		delete kv;
 		return false;
 	}
@@ -728,7 +1149,7 @@ stock bool LoadConfiguredRestarts(bool bReload = true)
 	if (!kv.GotoFirstSubKey())
 	{
 		delete kv;
-		return false;
+		return true;
 	}
 
 	if (bReload && g_iConfiguredRestarts != null)
@@ -737,86 +1158,51 @@ stock bool LoadConfiguredRestarts(bool bReload = true)
 	if (g_iConfiguredRestarts == null)
 		g_iConfiguredRestarts = new ArrayList(sizeof(ConfiguredRestart));
 
+	char sKeyName[16];
+	char sValue[16];
+
 	do
 	{
-		char sSectionValue[10];
-		kv.GetString("day", sSectionValue, sizeof(sSectionValue), "");
-		if (strcmp(sSectionValue, "") == 0)
-			continue;
+		kv.GetSectionName(sKeyName, sizeof(sKeyName));
 
 		ConfiguredRestart configuredRestart;
-		configuredRestart.iDay = StringToInt(sSectionValue);
+		bool bValid = true;
 
-		if (configuredRestart.iDay < 1 || configuredRestart.iDay > 7)
-			continue;
+		kv.GetString("day", sValue, sizeof(sValue), "");
+		configuredRestart.iDay = StringToInt(sValue);
+		if (sValue[0] == '\0')
+		{
+			// Empty day is the documented way to leave a schedule slot disabled - skip silently.
+			bValid = false;
+		}
+		else if (configuredRestart.iDay < 1 || configuredRestart.iDay > 7)
+		{
+			LogError("[FixMemoryLeak] Restart schedule entry '%s': invalid day '%s' (expected 1-7, Monday=1), skipping.", sKeyName, sValue);
+			bValid = false;
+		}
 
-		kv.GetString("hour", sSectionValue, sizeof(sSectionValue), "");
+		kv.GetString("hour", sValue, sizeof(sValue), "");
+		configuredRestart.iHour = StringToInt(sValue);
+		if (bValid && (sValue[0] == '\0' || configuredRestart.iHour < 0 || configuredRestart.iHour > 23))
+		{
+			LogError("[FixMemoryLeak] Restart schedule entry '%s': invalid hour '%s' (expected 0-23), skipping.", sKeyName, sValue);
+			bValid = false;
+		}
 
-		if (strcmp(sSectionValue, "") == 0)
-			continue;
+		kv.GetString("minute", sValue, sizeof(sValue), "");
+		configuredRestart.iMinute = StringToInt(sValue);
+		if (bValid && (sValue[0] == '\0' || configuredRestart.iMinute < 0 || configuredRestart.iMinute > 59))
+		{
+			LogError("[FixMemoryLeak] Restart schedule entry '%s': invalid minute '%s' (expected 0-59), skipping.", sKeyName, sValue);
+			bValid = false;
+		}
 
-		configuredRestart.iHour = StringToInt(sSectionValue);
+		if (bValid)
+			g_iConfiguredRestarts.PushArray(configuredRestart, sizeof(configuredRestart));
 
-		if (configuredRestart.iHour < 0 || configuredRestart.iHour > 24)
-			continue;
-
-		kv.GetString("minute", sSectionValue, sizeof(sSectionValue), "");
-		if (strcmp(sSectionValue, "") == 0)
-			continue;
-
-		configuredRestart.iMinute = StringToInt(sSectionValue);
-
-		if (configuredRestart.iMinute < 0 || configuredRestart.iMinute > 59)
-			continue;
-
-		g_iConfiguredRestarts.PushArray(configuredRestart, sizeof(configuredRestart));
-
-	} while(kv.GotoNextKey());
-
-	delete kv;
-
-	return true;
-}
-
-stock void SetSectionValue(const char[] sConfigName, const char[] sSectionName, const char[] sSectionValue)
-{
-	KeyValues kv;
-	GetConfigKv(kv);
-
-	if (!kv.JumpToKey(sConfigName))
-	{
-		delete kv;
-		return;
-	}
-
-	kv.SetString(sSectionName, sSectionValue);
-
-	char sFile[PLATFORM_MAX_PATH];
-	BuildPath(Path_SM, sFile, sizeof(sFile), CONFIG_PATH);
-
-	kv.Rewind();
-	kv.ExportToFile(sFile);
+	} while (kv.GotoNextKey());
 
 	delete kv;
-}
-
-stock bool GetSectionValue(const char[] sConfigName, const char[] sSectionName, char sSectionValue[PLATFORM_MAX_PATH])
-{
-	KeyValues kv;
-	GetConfigKv(kv);
-
-	if (!kv.JumpToKey(sConfigName))
-	{
-		delete kv;
-		return false;
-	}
-
-	kv.GetString(sSectionName, sSectionValue, sizeof(sSectionValue), "");
-
-	delete kv;
-
-	if (strcmp(sSectionValue, "") == 0)
-		return false;
 
 	return true;
 }
