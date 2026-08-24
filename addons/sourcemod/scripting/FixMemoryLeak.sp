@@ -1047,9 +1047,23 @@ stock bool ExportConfigAtomic(KeyValues kv)
 	if (!kv.ExportToFile(sTmp))
 		return false;
 
-	// Validate the temp file actually parses before trusting it over the live config.
+	// Validate the temp file actually parses AND still has all three required sections
+	// before trusting it over the live config. ExportToFile round-tripping the in-memory
+	// tree can still yield a technically-parseable file that is missing a section (e.g.
+	// if the section was empty) - without this schema check, that broken file would get
+	// promoted over the last known-good config, and the next read would discover the
+	// corruption too late and wipe the whole file (including the admin's schedule) back
+	// to defaults.
 	KeyValues kvCheck = new KeyValues(CONFIG_KV_NAME);
 	bool bValid = kvCheck.ImportFromFile(sTmp);
+
+	char sMissing[64];
+	if (bValid && !HasValidConfigSchema(kvCheck, sMissing, sizeof(sMissing)))
+	{
+		LogError("[FixMemoryLeak] Refusing to persist restart state: exporting it produced a config missing section(s): %s - keeping the previous file on disk.", sMissing);
+		bValid = false;
+	}
+
 	delete kvCheck;
 
 	if (!bValid)
