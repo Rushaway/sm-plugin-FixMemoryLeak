@@ -35,6 +35,20 @@
         "es"            "{default}Por motivos de mantenimiento, el servidor se reiniciará en {green}{1} {default}minutos."
     }
 
+    // CheckAndAnnounceCountdown - used instead of "Restart Countdown" once 2+ hours remain
+    "Restart Countdown Hours"
+    {
+        // 1: Hours remaining
+        "#format"       "{1:i}"
+
+        "en"            "{default}For maintenance reasons, the server will restart in {green}{1} {default}hours."
+        "zho"           "{default}由於維護原因，伺服器將在 {green}{1} {default}小時後重啓。"
+        "chi"           "{default}由于维护原因，伺服器将在 {green}{1} {default}小时后重启。"
+        "fr"            "{default}Pour des raisons de maintenance, le serveur va être redémarré dans {green}{1} {default}heures."
+        "ru"            "{default}По техническим причинам сервер перезагрузится через {green}{1} {default}часов."
+        "es"            "{default}Por motivos de mantenimiento, el servidor se reiniciará en {green}{1} {default}horas."
+    }
+
     // Command_SvNextRestart
     "Next Restart"
     {

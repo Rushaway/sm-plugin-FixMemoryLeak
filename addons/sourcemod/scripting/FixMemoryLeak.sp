@@ -749,7 +749,12 @@ stock bool ShouldAnnounceCountdown(int iRemainingMin, int iWarnCloseMin, float f
 
 stock void AnnounceCountdown(int iMinutes)
 {
-	CPrintToChatAll("%t %t", "Prefix", "Restart Countdown", iMinutes);
+	// Past 2 hours remaining, showing raw minutes ("in 156 minutes") is noise - round
+	// down to whole hours instead ("in 2 hours").
+	if (iMinutes >= 120)
+		CPrintToChatAll("%t %t", "Prefix", "Restart Countdown Hours", iMinutes / 60);
+	else
+		CPrintToChatAll("%t %t", "Prefix", "Restart Countdown", iMinutes);
 }
 
 stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart, int iNow)
