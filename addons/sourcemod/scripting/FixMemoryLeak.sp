@@ -921,7 +921,7 @@ stock int GetNextRestartTime(int iNow)
 // three top-level sections, so on a healthy file (however it was hand-edited) all three
 // are always reachable directly under the root - if one is missing after a "successful"
 // import, the file is malformed, not just intentionally minimal.
-stock bool HasValidConfigSchema(KeyValues kv)
+stock bool HasValidConfigSchema(KeyValues kv, char[] sMissing = "", int iMissingLen = 0)
 {
 	kv.Rewind();
 	bool bHasCommands = kv.JumpToKey(CONFIG_KV_COMMANDS_NAME);
@@ -930,6 +930,17 @@ stock bool HasValidConfigSchema(KeyValues kv)
 	kv.Rewind();
 	bool bHasRestart = kv.JumpToKey(CONFIG_KV_RESTART_NAME);
 	kv.Rewind();
+
+	if (iMissingLen > 0)
+	{
+		sMissing[0] = '\0';
+		if (!bHasCommands)
+			StrCat(sMissing, iMissingLen, "\"commands\" ");
+		if (!bHasInfo)
+			StrCat(sMissing, iMissingLen, "\"info\" ");
+		if (!bHasRestart)
+			StrCat(sMissing, iMissingLen, "\"restart\" ");
+	}
 
 	return bHasCommands && bHasInfo && bHasRestart;
 }
@@ -941,18 +952,28 @@ stock bool GetConfigKv(KeyValues &kv)
 	char sFile[PLATFORM_MAX_PATH];
 	BuildPath(Path_SM, sFile, sizeof(sFile), CONFIG_PATH);
 
-	if (FileExists(sFile) && kv.ImportFromFile(sFile) && HasValidConfigSchema(kv))
+	bool bFileExists = FileExists(sFile);
+	bool bImported = bFileExists && kv.ImportFromFile(sFile);
+
+	char sMissing[64];
+	if (bImported && HasValidConfigSchema(kv, sMissing, sizeof(sMissing)))
 		return true;
 
-	if (FileExists(sFile))
+	if (bFileExists)
 	{
 		char sBackup[PLATFORM_MAX_PATH];
 		FormatEx(sBackup, sizeof(sBackup), "%s.corrupt-%d", sFile, GetTime());
 
-		if (RenameFile(sBackup, sFile))
-			LogError("[FixMemoryLeak] Config file was unreadable or malformed, backed up to '%s' and regenerating defaults.", sBackup);
+		char sReason[96];
+		if (!bImported)
+			strcopy(sReason, sizeof(sReason), "file failed to parse (invalid KeyValues syntax, e.g. stray brace or a BOM/encoding issue)");
 		else
-			LogError("[FixMemoryLeak] Config file was unreadable or malformed and could not be backed up; overwriting with defaults.");
+			FormatEx(sReason, sizeof(sReason), "missing required section(s): %s", sMissing);
+
+		if (RenameFile(sBackup, sFile))
+			LogError("[FixMemoryLeak] Config file was unreadable or malformed (%s), backed up to '%s' and regenerating defaults.", sReason, sBackup);
+		else
+			LogError("[FixMemoryLeak] Config file was unreadable or malformed (%s) and could not be backed up; overwriting with defaults.", sReason);
 	}
 
 	WriteDefaultConfig(sFile);
