@@ -136,8 +136,6 @@ public void OnPluginStart()
 
 public void OnPluginEnd()
 {
-	UnhookEvent("round_end", OnRoundEnd, EventHookMode_Pre);
-
 	if (g_iConfiguredRestarts != null)
 		delete g_iConfiguredRestarts;
 }
@@ -309,7 +307,7 @@ public Action Command_RestartServer(int client, int argc)
 	char sNextMap[PLATFORM_MAX_PATH];
 	if (!GetNextMap(sNextMap, sizeof(sNextMap)))
 	{
-		CPrintToChat(client, "%t %t", "Prefix", "No Nextmap Set");
+		CReplyToCommand(client, "%t %t", "Prefix", "No Nextmap Set");
 		return Plugin_Handled;
 	}
 
@@ -821,6 +819,13 @@ stock void AnnounceCountdown(int iMinutes)
 		CPrintToChatAll("%t %t", "Prefix", "Restart Countdown", iMinutes);
 }
 
+// Known limitation: this walks day-to-day in flat 24*60*60-second steps, which assumes
+// every day is exactly 86400 seconds of wall-clock time. During the week a DST transition
+// happens, a local day is actually 82800s (spring-forward) or 90000s (fall-back), so the
+// configured hour/minute can land up to 1h off that week. SourcePawn has no DST-aware
+// mktime()-equivalent to compute "epoch for this local Y-M-D H:M" correctly, so this is
+// accepted rather than fixed - re-verify the schedule (or just expect a possible 1h drift)
+// around DST changes.
 stock int GetConfiguredRestartTime(ConfiguredRestart configuredRestart, int iNow)
 {
 	char sBuffer[10];
