@@ -164,6 +164,14 @@ public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] new
 		g_iWarnInterval = g_cWarnInterval.IntValue;
 	else if (convar == g_cWarnCloseInterval)
 		g_iWarnCloseInterval = g_cWarnCloseInterval.IntValue;
+
+	// sm_restart_mode/sm_restart_delay/sm_restart_min_uptime all feed directly into
+	// GetNextRestartTime() - without this, the persisted/announced g_iNextRestartTime
+	// stays stuck at whatever it was computed to before the change, causing exactly the
+	// kind of mismatch where the countdown says "19 hours" but sm_svnextrestart says
+	// "1 minute" right after an admin tweaks sm_restart_delay live.
+	if (convar == g_cRestartMode || convar == g_cRestartDelay || convar == g_cMinUptime)
+		RefreshNextRestartTime();
 }
 
 public void OnMapStart()
@@ -318,7 +326,12 @@ public Action Command_SvNextRestart(int client, int argc)
 		case 0:
 		{
 			int iUptime = CalculateUptime();
-			int iMinsUntilRestart = (iUptime + g_iDelay) - iUptime;
+			int iTime = GetModeZeroThresholdMinutes(g_iDelay, g_bEarlyRestart, g_bEarlyRestart ? AnyRealPlayerConnected() : false, g_iMinUptime);
+
+			int iMinsUntilRestart = iTime - iUptime;
+			if (iMinsUntilRestart < 0)
+				iMinsUntilRestart = 0;
+
 			int iHours = iMinsUntilRestart / 60;
 			int iDays = iHours / 24;
 			iHours = iHours % 24;
@@ -346,6 +359,10 @@ public Action Command_DebugConfig(int client, int argc)
 
 	if (LoadConfiguredRestarts())
 	{
+		// The schedule may have just changed - keep the announced/queried next restart
+		// time in sync with it instead of leaving it stale until the next natural event.
+		RefreshNextRestartTime();
+
 		if (g_bDebug)
 		{
 			CReplyToCommand(client, "{red}[Debug] T = Current | {green}C = Configured.");
@@ -485,6 +502,26 @@ public Action Command_SelfTest(int client, int argc)
 		else { iFail++; ReplyToCommand(client, "[FAIL] ShouldAnnounceCountdown still respects the short interval floor (expected false)"); }
 	}
 
+	// GetModeZeroThresholdMinutes: the mode-0 trigger (IsRestartNeeded) and the display
+	// (sm_svnextrestart) must always agree on this value.
+	{
+		int iResult = GetModeZeroThresholdMinutes(60, false, false, 10);
+		if (iResult == 60) { iPass++; ReplyToCommand(client, "[PASS] GetModeZeroThresholdMinutes ignores early-restart when disabled"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] GetModeZeroThresholdMinutes ignores early-restart when disabled (expected 60, got %d)", iResult); }
+
+		iResult = GetModeZeroThresholdMinutes(60, true, false, 10);
+		if (iResult == 30) { iPass++; ReplyToCommand(client, "[PASS] GetModeZeroThresholdMinutes halves the delay on an empty server"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] GetModeZeroThresholdMinutes halves the delay on an empty server (expected 30, got %d)", iResult); }
+
+		iResult = GetModeZeroThresholdMinutes(60, true, true, 10);
+		if (iResult == 60) { iPass++; ReplyToCommand(client, "[PASS] GetModeZeroThresholdMinutes does not halve while players are connected"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] GetModeZeroThresholdMinutes does not halve while players are connected (expected 60, got %d)", iResult); }
+
+		iResult = GetModeZeroThresholdMinutes(10, true, false, 30);
+		if (iResult == 30) { iPass++; ReplyToCommand(client, "[PASS] GetModeZeroThresholdMinutes still respects min_uptime after halving"); }
+		else { iFail++; ReplyToCommand(client, "[FAIL] GetModeZeroThresholdMinutes still respects min_uptime after halving (expected 30, got %d)", iResult); }
+	}
+
 	ReplyToCommand(client, "[FixMemoryLeak] Selftest complete: %d passed, %d failed.", iPass, iFail);
 	return Plugin_Handled;
 }
@@ -572,6 +609,31 @@ stock bool IsCooldownActive(int iLastRestart, int iCooldownMinutes, int iNow)
 	return iLastRestart > 0 && (iNow - iLastRestart) < (iCooldownMinutes * 60);
 }
 
+stock bool AnyRealPlayerConnected()
+{
+	for (int i = 1; i <= MaxClients; i++)
+	{
+		if (IsClientConnected(i) && !IsFakeClient(i))
+			return true;
+	}
+	return false;
+}
+
+// Mode 0's "minutes of uptime before we restart" threshold, shared by IsRestartNeeded()
+// (the actual trigger) and Command_SvNextRestart (the display) so they can never disagree.
+stock int GetModeZeroThresholdMinutes(int iDelay, bool bEarlyRestart, bool bHasPlayers, int iMinUptime)
+{
+	int iTime = iDelay;
+
+	if (bEarlyRestart && !bHasPlayers)
+		iTime /= 2;
+
+	if (iTime < iMinUptime)
+		iTime = iMinUptime;
+
+	return iTime;
+}
+
 stock bool IsRestartNeeded()
 {
 	int currentTime = GetTime();
@@ -579,31 +641,14 @@ stock bool IsRestartNeeded()
 	if (IsCooldownActive(g_iLastRestartTime, g_iCooldown, currentTime))
 		return false;
 
-	bool bHasPlayers = false;
-	if (g_bEarlyRestart)
-	{
-		for (int i = 1; i <= MaxClients; i++)
-		{
-			if (IsClientConnected(i) && !IsFakeClient(i))
-			{
-				bHasPlayers = true;
-				break;
-			}
-		}
-	}
+	bool bHasPlayers = g_bEarlyRestart ? AnyRealPlayerConnected() : false;
 
 	switch (g_iMode)
 	{
 		case 0:
 		{
 			int iUptime = CalculateUptime();
-			int iTime = g_iDelay;
-
-			if (g_bEarlyRestart && !bHasPlayers)
-				iTime /= 2;
-
-			if (iTime < g_iMinUptime)
-				iTime = g_iMinUptime;
+			int iTime = GetModeZeroThresholdMinutes(g_iDelay, g_bEarlyRestart, bHasPlayers, g_iMinUptime);
 
 			return iUptime >= iTime;
 		}
@@ -717,6 +762,19 @@ stock void SetNextRestart(int iNextTime, const char[] sMap)
 	// New target time: let the next check announce it right away.
 	g_flLastWarnTime = 0.0;
 	g_bNextMapSet = true;
+}
+
+// Recomputes g_iNextRestartTime from the *current* mode/delay/min_uptime, keeping
+// whatever nextmap is already tracked. Unlike SetupNextRestartNextMap(), this ignores
+// the g_bNextMapSet guard on purpose - it exists specifically to force a refresh when
+// an admin changes the scheduling convars or reloads the schedule live, so the
+// announced/queried next restart time never goes stale mid-map.
+stock void RefreshNextRestartTime()
+{
+	if (g_sNextRestartMap[0])
+		SetNextRestart(GetNextRestartTime(GetTime()), g_sNextRestartMap);
+	else
+		SetupNextRestartNextMap("");
 }
 
 /**
