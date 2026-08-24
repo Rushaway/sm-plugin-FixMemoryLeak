@@ -915,6 +915,25 @@ stock int GetNextRestartTime(int iNow)
  * A missing or corrupted file is regenerated with safe defaults; a corrupted file is
  * first backed up (".corrupt-<timestamp>") so nothing is silently lost.
  */
+// KeyValues.ImportFromFile() is lenient about malformed braces - it can return true
+// on a genuinely broken file (mismatched "{"/"}") while silently nesting sections in
+// the wrong place instead of failing outright. WriteDefaultConfig() always creates all
+// three top-level sections, so on a healthy file (however it was hand-edited) all three
+// are always reachable directly under the root - if one is missing after a "successful"
+// import, the file is malformed, not just intentionally minimal.
+stock bool HasValidConfigSchema(KeyValues kv)
+{
+	kv.Rewind();
+	bool bHasCommands = kv.JumpToKey(CONFIG_KV_COMMANDS_NAME);
+	kv.Rewind();
+	bool bHasInfo = kv.JumpToKey(CONFIG_KV_INFO_NAME);
+	kv.Rewind();
+	bool bHasRestart = kv.JumpToKey(CONFIG_KV_RESTART_NAME);
+	kv.Rewind();
+
+	return bHasCommands && bHasInfo && bHasRestart;
+}
+
 stock bool GetConfigKv(KeyValues &kv)
 {
 	kv = new KeyValues(CONFIG_KV_NAME);
@@ -922,7 +941,7 @@ stock bool GetConfigKv(KeyValues &kv)
 	char sFile[PLATFORM_MAX_PATH];
 	BuildPath(Path_SM, sFile, sizeof(sFile), CONFIG_PATH);
 
-	if (FileExists(sFile) && kv.ImportFromFile(sFile))
+	if (FileExists(sFile) && kv.ImportFromFile(sFile) && HasValidConfigSchema(kv))
 		return true;
 
 	if (FileExists(sFile))
@@ -931,9 +950,9 @@ stock bool GetConfigKv(KeyValues &kv)
 		FormatEx(sBackup, sizeof(sBackup), "%s.corrupt-%d", sFile, GetTime());
 
 		if (RenameFile(sBackup, sFile))
-			LogError("[FixMemoryLeak] Config file was unreadable, backed up to '%s' and regenerating defaults.", sBackup);
+			LogError("[FixMemoryLeak] Config file was unreadable or malformed, backed up to '%s' and regenerating defaults.", sBackup);
 		else
-			LogError("[FixMemoryLeak] Config file was unreadable and could not be backed up; overwriting with defaults.");
+			LogError("[FixMemoryLeak] Config file was unreadable or malformed and could not be backed up; overwriting with defaults.");
 	}
 
 	WriteDefaultConfig(sFile);
