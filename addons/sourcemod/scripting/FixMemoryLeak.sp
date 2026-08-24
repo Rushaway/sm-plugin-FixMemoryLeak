@@ -340,8 +340,15 @@ public Action Command_SvNextRestart(int client, int argc)
 		{
 			char buffer[768], rTime[768];
 			int iRemaining = g_iNextRestartTime - GetTime();
+			if (iRemaining < 0)
+				iRemaining = 0;
+
 			FormatTime(buffer, sizeof(buffer), "%A %d %B %G @ %r", g_iNextRestartTime);
-			FormatTime(rTime, sizeof(rTime), "%X", iRemaining);
+			// Plain HH:MM:SS from the raw second count, not FormatTime("%X", iRemaining) -
+			// that formatted the duration as if it were a UTC epoch timestamp and let the
+			// server's local timezone/DST rules (evaluated against Jan 1 1970, not today)
+			// shift the displayed value, which only looked right by coincidence.
+			FormatEx(rTime, sizeof(rTime), "%02d:%02d:%02d", iRemaining / 3600, (iRemaining % 3600) / 60, iRemaining % 60);
 
 			CReplyToCommand(client, "%t %t", "Prefix", "Next Restart Time", buffer);
 			CReplyToCommand(client, "%t %t", "Prefix", "Remaining Time", rTime);
