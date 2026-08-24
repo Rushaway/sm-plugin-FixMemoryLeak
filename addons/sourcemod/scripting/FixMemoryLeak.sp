@@ -189,6 +189,12 @@ public void OnMapStart()
 		{
 			LogError("[FixMemoryLeak] Persisted nextmap '%s' is not valid, staying on the current map.", g_sNextRestartMap);
 		}
+
+		// Close the loop right away: compute and persist the *next* restart cycle now,
+		// instead of leaving restarted/changed stuck at "1" until something else (the
+		// next scheduled restart, or MapChooser Extended's OnSetNextMap if present)
+		// eventually gets around to recomputing it.
+		SetupNextRestartNextMap("");
 	}
 
 	CheckAndAnnounceCountdown();
